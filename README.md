@@ -159,4 +159,4 @@ MIT
 
 ## Author
 
-**Hayes Zhang** (张无常) — 前飞书 AI Agent 产品经理，公众号「张无常」
+**Hayes Zhang** (张无常) — 前字节跳动飞书/AnyGen AI 产品经理，公众号「张无常」
