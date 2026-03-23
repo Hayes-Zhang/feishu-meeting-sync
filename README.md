@@ -6,9 +6,27 @@ Sync Feishu (飞书) meeting minutes to local Markdown files — with AI summary
 
 ## 它能做什么
 
-给一个飞书智能纪要链接，自动拉取：
+配合 Claude Code 使用，你可以直接用自然语言操作：
+
+> "帮我拉一下今天的会议纪要"
+>
+> "同步一下最近跟孔某人聊的会议"
+>
+> "把这个会议拉下来 https://xxx.feishu.cn/docx/ABC123"
+
+也可以直接命令行：
+
+```bash
+feishu-sync --today                                    # 今天的会议
+feishu-sync --search "产品讨论"                          # 按关键词搜索
+feishu-sync https://xxx.feishu.cn/docx/ABC123          # 指定智能纪要
+feishu-sync https://xxx.feishu.cn/minutes/obcnXXX      # 妙记录音
+```
+
+自动拉取的内容：
 - **智能纪要** — Markdown 格式，AI 总结画板嵌在「总结」下方，其他图片放附件
 - **文字记录（逐字稿）** — 自动从智能纪要的「相关链接」中解析并拉取
+- **妙记录音转录** — 带说话人 + 时间戳
 - **每次会议一个文件夹** — `日期 主题 [开始时间]`，同一天多场会议自动用时间区分
 
 ```
