@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""
+feishu-meeting-sync — 飞书会议纪要同步工具
+Sync Feishu (飞书) meeting minutes to local markdown files.
+
+https://github.com/Hayes-Zhang/feishu-meeting-sync
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+
+# ─── 配置（可通过环境变量覆盖）───
+
+NOTES_DIR = Path(os.environ.get("FEISHU_SYNC_DIR", Path.home() / "feishu-meetings"))
+LARK_BIN = Path(os.environ.get("LARK_BIN", Path.home() / "bin" / "lark"))
+FEISHU_API = "https://open.feishu.cn/open-apis"
+CONFIG_DIR = Path(os.environ.get("LARK_CONFIG_DIR", Path.home() / ".lark"))
+SYNC_RECORD = CONFIG_DIR / "synced.json"
+
+# ─── 基础工具 ───
+
+def get_env():
+    env = os.environ.copy()
+    env["LARK_CONFIG_DIR"] = str(CONFIG_DIR)
+    return env
+
+def get_access_token():
+    with open(CONFIG_DIR / "tokens.json") as f:
+        data = json.load(f)
+    expires_at = data.get("expires_at", "")
+    if expires_at:
+        try:
+            exp = datetime.fromisoformat(expires_at)
+            now = datetime.now(exp.tzinfo) if exp.tzinfo else datetime.now()
+            if now >= exp:
+                print("⏳ Token 已过期，自动刷新...")
+                refresh_token()
+                with open(CONFIG_DIR / "tokens.json") as f:
+                    data = json.load(f)
+        except Exception:
+            pass
+    return data["access_token"]
+
+def refresh_token():
+    result = subprocess.run(
+        [str(LARK_BIN), "auth", "login", "--scopes", "minutes,documents"],
+        capture_output=False, env=get_env(), timeout=300
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Token 刷新失败，请手动运行: lark auth login --scopes minutes,documents")
+
+def run_lark(*args):
+    result = subprocess.run(
+        [str(LARK_BIN)] + list(args),
+        capture_output=True, text=True, env=get_env()
+    )
+    if result.returncode != 0:
+        output = result.stdout + result.stderr
+        if "AUTH_ERROR" in output or "Not authenticated" in output:
+            print("⏳ 认证失效，自动重新登录...")
+            refresh_token()
+            result = subprocess.run(
+                [str(LARK_BIN)] + list(args),
+                capture_output=True, text=True, env=get_env()
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"lark {' '.join(args)} failed: {result.stdout}{result.stderr}")
+        else:
+            raise RuntimeError(f"lark {' '.join(args)} failed: {output}")
+    return json.loads(result.stdout)
+
+def download_image(image_token, doc_id, output_path):
+    result = subprocess.run(
+        [str(LARK_BIN), "doc", "image", image_token, "--doc", doc_id, "-o", str(output_path)],
+        capture_output=True, text=True, env=get_env()
+    )
+    return result.returncode == 0
+
+def download_board_image(whiteboard_token, output_path):
+    token = get_access_token()
+    url = f"{FEISHU_API}/board/v1/whiteboards/{whiteboard_token}/download_as_image"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if "json" in resp.headers.get("Content-Type", ""):
+                return False
+            with open(output_path, "wb") as f:
+                f.write(resp.read())
+            return True
+    except Exception:
+        return False
+
+def get_raw_blocks(doc_id):
+    token = get_access_token()
+    all_items, page_token = [], ""
+    while True:
+        url = f"{FEISHU_API}/docx/v1/documents/{doc_id}/blocks?page_size=500"
+        if page_token:
+            url += f"&page_token={page_token}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+        all_items.extend(data.get("data", {}).get("items", []))
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data.get("data", {}).get("page_token", "")
+    return all_items
+
+def is_minutes_url(url_or_id):
+    """判断是否是妙记（/minutes/）链接"""
+    return "/minutes/" in url_or_id
+
+def extract_doc_id(url_or_id):
+    if "/" in url_or_id:
+        return url_or_id.rstrip("/").split("/")[-1].split("?")[0]
+    return url_or_id
+
+def safe_dirname(name):
+    return re.sub(r'[/:*?"<>|]', '_', name)
+
+def extract_meeting_time(content):
+    m = re.search(r'会议时间：.*?(\d{1,2}:\d{2})\s', content)
+    if m:
+        return m.group(1).replace(":", "")
+    return ""
+
+def find_transcript_doc_ids(content):
+    doc_ids = []
+    in_transcript = False
+    for line in content.split('\n'):
+        if '文字记录' in line:
+            in_transcript = True
+        elif re.match(r'^-\s', line) and in_transcript and 'feishu' not in line:
+            in_transcript = False
+        if in_transcript:
+            for m in re.finditer(r'feishu\.cn/docx/([A-Za-z0-9]+)', line):
+                doc_ids.append(m.group(1))
+    if not doc_ids:
+        doc_ids = re.findall(r'feishu\.cn/docx/([A-Za-z0-9]+)', content)
+    return doc_ids
+
+# ─── 增量同步记录 ───
+
+def load_synced():
+    if SYNC_RECORD.exists():
+        with open(SYNC_RECORD) as f:
+            return json.load(f)
+    return {}
+
+def save_synced(record):
+    with open(SYNC_RECORD, "w") as f:
+        json.dump(record, f, ensure_ascii=False, indent=2)
+
+def is_synced(doc_id):
+    return doc_id in load_synced()
+
+def mark_synced(doc_id, folder_name):
+    record = load_synced()
+    record[doc_id] = {"folder": folder_name, "synced_at": datetime.now().isoformat()}
+    save_synced(record)
+
+# ─── 文档拉取 ───
+
+def fetch_doc(doc_id, output_dir, filename_prefix):
+    doc_data = run_lark("doc", "get", doc_id)
+    title = doc_data.get("title", "untitled")
+    content = doc_data.get("content", "")
+    content = re.sub(r'</?table>|</?tbody>|</?tr>|</?td>', '', content)
+    content = re.sub(r'\n{3,}', '\n\n', content)
+
+    raw_blocks = get_raw_blocks(doc_id)
+    img_dir = output_dir / "images"
+    board_refs, image_refs = [], []
+    total_media = 0
+
+    for b in raw_blocks:
+        bt = b.get("block_type", 0)
+        if bt == 43 and "board" in b:
+            token = b["board"].get("token", "")
+            if token:
+                img_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"board_{token}.png"
+                if download_board_image(token, img_dir / fname):
+                    board_refs.append(f"images/{fname}")
+                    total_media += 1
+                    print(f"  🎨 下载画板: {fname}")
+        elif bt == 27 and "image" in b:
+            token = b["image"].get("token", "")
+            if token:
+                img_dir.mkdir(parents=True, exist_ok=True)
+                fname = f"img_{token}.png"
+                if download_image(token, doc_id, img_dir / fname):
+                    image_refs.append(f"images/{fname}")
+                    total_media += 1
+                    print(f"  📷 下载图片: {fname}")
+
+    if board_refs:
+        board_md = "\n\n" + "\n\n".join(f"![AI总结画板]({p})" for p in board_refs) + "\n"
+        if "# 总结" in content:
+            content = content.replace("# 总结", "# 总结" + board_md, 1)
+        else:
+            content = content + board_md
+
+    if image_refs:
+        content += "\n\n---\n\n## 附件\n\n"
+        content += "\n\n".join(f"![图片]({p})" for p in image_refs) + "\n"
+
+    md_path = output_dir / f"{filename_prefix}.md"
+    md_path.write_text(content, encoding="utf-8")
+    return title, str(md_path), total_media, content
+
+# ─── 会议同步 ───
+
+def make_folder_name(title, content):
+    date_match = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', title)
+    if date_match:
+        y, m, d = date_match.groups()
+        date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+    else:
+        date_str = "unknown"
+
+    topic = re.sub(r'^(智能纪要|文字记录)[：:]?\s*', '', title)
+    topic = re.sub(r'\s*\d{4}年\d{1,2}月\d{1,2}日\s*$', '', topic).strip()
+    if not topic:
+        topic = "未命名"
+
+    base_name = f"{date_str} {topic}"
+
+    candidate = NOTES_DIR / safe_dirname(base_name)
+    if candidate.exists():
+        time_str = extract_meeting_time(content)
+        if time_str:
+            base_name = f"{date_str} {topic} {time_str}"
+
+    return safe_dirname(base_name)
+
+def sync_minutes(minute_token, force=False):
+    """同步妙记录音（/minutes/ 链接）"""
+    if not force and is_synced(minute_token):
+        record = load_synced()[minute_token]
+        print(f"⏭️  已同步过: {record['folder']}（用 --force 强制重新同步）")
+        return
+
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 获取妙记元数据
+    meta = run_lark("minutes", "get", minute_token)
+    title = meta.get("title", "untitled")
+    create_time = meta.get("create_time", "")
+    duration = meta.get("duration_display", "")
+
+    # 提取日期
+    date_str = "unknown"
+    if create_time:
+        try:
+            dt = datetime.fromisoformat(create_time)
+            date_str = dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    folder_name = safe_dirname(f"{date_str} {title}")
+    meeting_dir = NOTES_DIR / folder_name
+    meeting_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"📁 {folder_name}")
+
+    # 导出带说话人和时间戳的转录
+    transcript_file = meeting_dir / f"{folder_name} 文字记录.md"
+    try:
+        transcript_data = run_lark("minutes", "transcript", minute_token,
+                                   "--speaker", "--timestamp")
+        content = transcript_data.get("content", "")
+        if content:
+            transcript_file.write_text(f"# {title} 文字记录\n\n{content}", encoding="utf-8")
+            print(f"✅ 文字记录已保存")
+        else:
+            # fallback：直接用 --output 写文件
+            subprocess.run(
+                [str(LARK_BIN), "minutes", "transcript", minute_token,
+                 "--speaker", "--timestamp", "--output", str(transcript_file)],
+                capture_output=True, text=True, env=get_env()
+            )
+            print(f"✅ 文字记录已保存")
+    except Exception as e:
+        print(f"⚠️ 文字记录导出失败: {e}")
+
+    # 写一个元数据摘要 markdown
+    summary_path = meeting_dir / f"{folder_name} 摘要.md"
+    summary_lines = [
+        f"# {title}\n",
+        f"- **日期**: {create_time}",
+        f"- **时长**: {duration}",
+        f"- **来源**: 飞书妙记录音",
+        f"- **链接**: {meta.get('url', '')}",
+    ]
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+
+    mark_synced(minute_token, folder_name)
+    print(f"✅ {title}（妙记录音）")
+
+def sync_meeting(url_or_id, force=False):
+    """同步一次会议（自动识别文档/妙记）"""
+    # 自动识别妙记链接
+    if is_minutes_url(url_or_id):
+        minute_token = extract_doc_id(url_or_id)
+        return sync_minutes(minute_token, force=force)
+
+    doc_id = extract_doc_id(url_or_id)
+
+    if not force and is_synced(doc_id):
+        record = load_synced()[doc_id]
+        print(f"⏭️  已同步过: {record['folder']}（用 --force 强制重新同步）")
+        return
+
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
+
+    doc_data = run_lark("doc", "get", doc_id)
+    title = doc_data.get("title", "untitled")
+    content = doc_data.get("content", "")
+
+    folder_name = make_folder_name(title, content)
+    meeting_dir = NOTES_DIR / folder_name
+    meeting_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"📁 {folder_name}")
+
+    t1, p1, m1, content = fetch_doc(doc_id, meeting_dir, f"{folder_name} 智能纪要")
+    media_info = f"（含 {m1} 个媒体文件）" if m1 > 0 else ""
+    print(f"✅ {t1}{media_info}")
+    mark_synced(doc_id, folder_name)
+
+    transcript_ids = find_transcript_doc_ids(content)
+    for tid in transcript_ids:
+        if tid == doc_id:
+            continue
+        try:
+            check = run_lark("doc", "get", tid)
+            check_title = check.get("title", "")
+            if "文字记录" not in check_title:
+                continue
+            print(f"🔗 拉取文字记录...")
+            t2, p2, m2, _ = fetch_doc(tid, meeting_dir, f"{folder_name} 文字记录")
+            print(f"✅ {t2}")
+            mark_synced(tid, folder_name)
+        except Exception as e:
+            print(f"⚠️ 文字记录拉取失败: {e}")
+
+# ─── 搜索发现 ───
+
+def search_meetings(query):
+    results = run_lark("doc", "search", query)
+    meetings = []
+    seen = set()
+    for r in results.get("results", []):
+        title = r.get("title", "")
+        token = r.get("token", "")
+        if "智能纪要" in title and token not in seen:
+            seen.add(token)
+            meetings.append({"token": token, "title": title})
+    return meetings
+
+def search_and_sync(query, force=False):
+    print(f"🔍 搜索: {query}")
+    meetings = search_meetings(query)
+
+    if not meetings:
+        print("未找到匹配的智能纪要")
+        print("💡 提示：如果是妙记录音（非智能纪要文档），请直接给 /minutes/ 链接同步")
+        return
+
+    print(f"找到 {len(meetings)} 个智能纪要:\n")
+    for i, m in enumerate(meetings):
+        synced = "✅已同步" if is_synced(m["token"]) else "⬜未同步"
+        print(f"  [{i+1}] {m['title']}  {synced}")
+    print()
+
+    synced_count = 0
+    for m in meetings:
+        if not force and is_synced(m["token"]):
+            continue
+        print(f"\n🔄 同步: {m['title']}")
+        try:
+            sync_meeting(m["token"], force=force)
+            synced_count += 1
+        except Exception as e:
+            print(f"❌ 失败: {e}")
+
+    if synced_count == 0:
+        print("所有会议已同步，无需操作")
+    else:
+        print(f"\n🎉 本次同步 {synced_count} 个会议")
+
+# ─── CLI ───
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args == ["--help"] or args == ["-h"]:
+        print("feishu-meeting-sync — 飞书会议纪要同步工具")
+        print()
+        print("用法:")
+        print("  feishu-sync <URL或doc_id> [更多...]              同步指定会议（支持 /docx/ 和 /minutes/ 链接）")
+        print("  feishu-sync --search <关键词>                  搜索并同步")
+        print("  feishu-sync --today                            同步今天的会议")
+        print("  feishu-sync --recent                           同步最近的会议")
+        print("  feishu-sync --force <...>                      强制重新同步")
+        print("  feishu-sync --list                             列出已同步的会议")
+        print()
+        print("环境变量:")
+        print(f"  FEISHU_SYNC_DIR    输出目录（默认: ~/feishu-meetings）")
+        print(f"  LARK_BIN           lark CLI 路径（默认: ~/bin/lark）")
+        print(f"  LARK_CONFIG_DIR    配置目录（默认: ~/.lark）")
+        print(f"  LARK_APP_ID        飞书应用 App ID")
+        print(f"  LARK_APP_SECRET    飞书应用 App Secret")
+        sys.exit(0)
+
+    force = "--force" in args
+    if force:
+        args.remove("--force")
+
+    if args[0] == "--search":
+        query = " ".join(args[1:]) if len(args) > 1 else "智能纪要"
+        search_and_sync(query, force=force)
+    elif args[0] == "--today":
+        today = datetime.now()
+        query = f"智能纪要 {today.year}年{today.month}月{today.day}日"
+        search_and_sync(query, force=force)
+    elif args[0] == "--recent":
+        search_and_sync("智能纪要", force=force)
+    elif args[0] == "--list":
+        record = load_synced()
+        if not record:
+            print("还没有同步过任何会议")
+        else:
+            folders = sorted(set(v["folder"] for v in record.values()))
+            print(f"已同步 {len(folders)} 个会议:\n")
+            for f in folders:
+                print(f"  📁 {f}")
+    else:
+        for url in args:
+            print(f"\n🔄 同步: {url}")
+            try:
+                sync_meeting(url, force=force)
+            except Exception as e:
+                print(f"❌ 失败: {e}")
+
+if __name__ == "__main__":
+    main()
