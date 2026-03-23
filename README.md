@@ -10,18 +10,9 @@ Sync Feishu (飞书) meeting minutes to local Markdown files — with AI summary
 
 > "帮我拉一下今天的会议纪要"
 >
-> "同步一下最近跟孔某人聊的会议"
+> "同步一下最近跟马斯克聊的会议"
 >
 > "把这个会议拉下来 https://xxx.feishu.cn/docx/ABC123"
-
-也可以直接命令行：
-
-```bash
-feishu-sync --today                                    # 今天的会议
-feishu-sync --search "产品讨论"                          # 按关键词搜索
-feishu-sync https://xxx.feishu.cn/docx/ABC123          # 指定智能纪要
-feishu-sync https://xxx.feishu.cn/minutes/obcnXXX      # 妙记录音
-```
 
 自动拉取的内容：
 - **智能纪要** — Markdown 格式，AI 总结画板嵌在「总结」下方，其他图片放附件
